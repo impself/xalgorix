@@ -25,7 +25,6 @@ build: webui
 	go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) ./cmd/xalgorix/
 	@echo "Built: $(BUILD_DIR)/$(BINARY)"
 
-
 run:
 	go run ./cmd/xalgorix/ $(ARGS)
 
