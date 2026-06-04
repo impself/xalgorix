@@ -150,7 +150,7 @@ var builtinList = []Entry{
 		BaseURL:     "https://api.deepseek.com/v1",
 		HeaderStyle: "openai",
 		AuthMethods: []string{"api_key"},
-		Models:      []string{"deepseek-chat", "deepseek-reasoner"},
+		Models:      []string{"deepseek-v4-pro", "deepseek-v4-flash"},
 	},
 	{
 		ID:          "fireworks",

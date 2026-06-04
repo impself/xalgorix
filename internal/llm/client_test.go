@@ -154,7 +154,7 @@ func TestNewClient_ProviderParsedFromModel(t *testing.T) {
 		{"openai/gpt-5.4", "openai"},
 		{"anthropic/claude-sonnet", "anthropic"},
 		{"google/gemini-3.1-flash", "google"},
-		{"deepseek/deepseek-chat", "deepseek"},
+		{"deepseek/deepseek-v4-pro", "deepseek"},
 		{"no-slash-model", ""},
 	}
 	for _, tc := range cases {

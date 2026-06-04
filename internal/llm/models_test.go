@@ -14,7 +14,7 @@ func TestResolveProvider_ExplicitPrefix(t *testing.T) {
 		{"openai/gpt-4o", "openai", "gpt-4o", true},
 		{"anthropic/claude-sonnet-4-20250514", "anthropic", "claude-sonnet-4-20250514", true},
 		{"google/gemini-2.5-pro", "google", "gemini-2.5-pro", true},
-		{"deepseek/deepseek-chat", "deepseek", "deepseek-chat", true},
+		{"deepseek/deepseek-v4-pro", "deepseek", "deepseek-v4-pro", true},
 		{"groq/llama-3.3-70b-versatile", "groq", "llama-3.3-70b-versatile", true},
 		{"xai/grok-3", "xai", "grok-3", true},
 	}
@@ -43,8 +43,8 @@ func TestResolveProvider_ExactMatch(t *testing.T) {
 	}{
 		{"gpt-4o", "openai", true},
 		{"gpt-4o-mini", "openai", true},
-		{"deepseek-chat", "deepseek", true},
-		{"deepseek-reasoner", "deepseek", true},
+		{"deepseek-v4-pro", "deepseek", true},
+		{"deepseek-v4-flash", "deepseek", true},
 		{"gemini-2.5-pro", "google", true},
 		{"gemini-2.5-flash", "google", true},
 	}
