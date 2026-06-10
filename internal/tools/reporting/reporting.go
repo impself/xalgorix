@@ -286,9 +286,20 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 	}
 
 	// ── Auto-downgrade: weak proof for high severity ──
+	// Drop by one severity level (not nuclear to "info") so CVSS enforcement
+	// can still correct it. E.g. high → medium, critical → high.
 	if originalSeverity == "" && isHighSeverity && !hasStrongEvidence(severity, proof, args["description"]) {
 		originalSeverity = severity
-		severity = "info"
+		switch severity {
+		case "critical":
+			severity = "high"
+		case "high":
+			severity = "medium"
+		case "medium":
+			severity = "low"
+		default:
+			severity = "info"
+		}
 	}
 
 	var cvss float64
@@ -300,6 +311,7 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 	// ── Gate 6: CVSS-to-Severity enforcement (HackerOne standard) ──
 	// If CVSS was provided, ensure severity matches the HackerOne CVSS ranges.
 	// CVSS is authoritative: Critical=9.0-10.0, High=7.0-8.9, Medium=4.0-6.9, Low=0.1-3.9, None=0.0
+	// This gate overrides all prior adjustments — the CVSS score is the source of truth.
 	if cvss > 0 {
 		cvssSeverity := severityFromCVSS(cvss)
 		if severityRank[severity] > severityRank[cvssSeverity] {
@@ -308,9 +320,11 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 				originalSeverity = severity
 			}
 			severity = cvssSeverity
-		} else if severityRank[severity] < severityRank[cvssSeverity] && originalSeverity == "" {
+		} else if severityRank[severity] < severityRank[cvssSeverity] {
 			// Severity label is lower than CVSS justifies → upgrade to match
-			originalSeverity = severity
+			if originalSeverity == "" {
+				originalSeverity = severity
+			}
 			severity = cvssSeverity
 		}
 	}
@@ -373,7 +387,11 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 
 	msg := fmt.Sprintf("✅ Vulnerability reported: [%s] %s (%s | CVSS %.1f) — Verified: %v", vuln.ID, vuln.Title, strings.ToUpper(vuln.Severity), vuln.CVSS, vuln.Verified)
 	if originalSeverity != "" {
-		msg += fmt.Sprintf("\n⚠️ SEVERITY ADJUSTED from %s → %s (CVSS %.1f maps to %s per HackerOne standards)", strings.ToUpper(originalSeverity), strings.ToUpper(severity), cvss, strings.ToUpper(severity))
+		if cvss > 0 {
+			msg += fmt.Sprintf("\n⚠️ SEVERITY ADJUSTED from %s → %s (CVSS %.1f = %s per HackerOne standards)", strings.ToUpper(originalSeverity), strings.ToUpper(severity), cvss, strings.ToUpper(severityFromCVSS(cvss)))
+		} else {
+			msg += fmt.Sprintf("\n⚠️ SEVERITY ADJUSTED from %s → %s", strings.ToUpper(originalSeverity), strings.ToUpper(severity))
+		}
 	}
 
 	return tools.Result{
@@ -561,12 +579,15 @@ func checkFalsePositive(title, description, severity, proof string) string {
 		return "❌ REJECTED: Analytics API writeKey bypass is NOT a vulnerability. writeKeys are PUBLIC client-side tokens shipped in JavaScript (Segment, Amplitude, Mixpanel, etc.). They are designed to be exposed. Bug bounty programs mark this as N/A or Informational. Do not report."
 	}
 
-	// Pattern 13: Rate limiting / brute force — almost always informational
+	// Pattern 13: Rate limiting / brute force — informational EXCEPT on sensitive endpoints
 	rateLimitKeywords := []string{"rate limit", "rate-limit", "no rate limit", "brute force", "brute-force",
 		"account lockout", "missing rate limit", "unlimited requests", "no lockout", "login throttling"}
 	for _, kw := range rateLimitKeywords {
 		if strings.Contains(lower, kw) && isHighSev {
-			return "❌ REJECTED: Missing rate limiting / brute force is INFORMATIONAL on HackerOne. Most programs explicitly exclude this. Re-report as 'info' at most."
+			// Exception: rate limiting on sensitive/auth endpoints is a real vuln
+			if !isSensitiveEndpointContext(lower, strings.ToLower(proof)) {
+				return "❌ REJECTED: Missing rate limiting / brute force is INFORMATIONAL on most endpoints. Re-report as 'info' — unless this is on a sensitive endpoint (login, password reset, OTP, 2FA, signup). If so, mention the sensitive endpoint clearly in the title/description."
+			}
 		}
 	}
 
@@ -926,6 +947,12 @@ func classifySeverity(title, description, severity, proof string) (string, strin
 	lower := strings.ToLower(title + " " + description)
 	lowerProof := strings.ToLower(proof)
 
+	// Normalize to canonical vuln type for consistent classification
+	// regardless of how the LLM titles the finding. This prevents
+	// "Stored XSS in CRM" and "Contact Injection / Stored XSS" from
+	// getting different severity caps.
+	vulnType := extractVulnType(title, description)
+
 	// ── INFO-only findings (max severity: info) ──
 	infoOnlyPatterns := []struct {
 		keywords []string
@@ -954,8 +981,8 @@ func classifySeverity(title, description, severity, proof string) (string, strin
 			"DNS zone transfer is informational in most contexts"},
 		{[]string{"writekey", "write_key", "write key", "analytics key", "segment key", "analytics api key"},
 			"Analytics writeKeys are public client-side tokens — not a security vulnerability"},
-		{[]string{"rate limit", "rate-limit", "no rate limit", "brute force", "account lockout", "missing rate limit"},
-			"Missing rate limiting is informational — most bug bounty programs exclude this"},
+		// NOTE: rate limit findings are handled separately below (low-cap with
+		// sensitive-endpoint exception) instead of blanket info-only.
 		{[]string{"sentry dsn", "ingest.sentry.io", "sentry.io/api"},
 			"Sentry DSN is a public client-side key — not a vulnerability"},
 		{[]string{"public_env", "next_public_", "react_app_", "window.__singletons"},
@@ -1034,6 +1061,13 @@ func classifySeverity(title, description, severity, proof string) (string, strin
 				return false
 			},
 			"Host header injection is low severity (CVSS 2.0-3.9) per HackerOne — needs password reset poisoning or cache poisoning chain for higher"},
+		// Rate limiting: low unless on sensitive auth endpoints
+		{[]string{"rate limit", "rate-limit", "no rate limit", "brute force", "brute-force",
+			"account lockout", "missing rate limit", "unlimited requests", "no lockout"},
+			func() bool {
+				return isSensitiveEndpointContext(lower, lowerProof)
+			},
+			"Missing rate limiting is low severity (CVSS 2.0-3.9) on non-sensitive endpoints — on login/password-reset/OTP/2FA endpoints it can be higher"},
 	}
 
 	for _, p := range lowCapPatterns {
@@ -1189,7 +1223,115 @@ func classifySeverity(title, description, severity, proof string) (string, strin
 		}
 	}
 
+	// ── vulnType-based fallback caps ──
+	// If the keyword-based caps above didn't fire (e.g., the LLM titled the
+	// finding "Contact Injection" instead of "Stored XSS"), apply caps based
+	// on the canonical vuln type extracted from title + description. This
+	// ensures consistent classification regardless of LLM title framing.
+	switch vulnType {
+	case "xss":
+		// Distinguish stored vs reflected/DOM
+		isStored := strings.Contains(lower, "stored") || strings.Contains(lower, "persistent") ||
+			strings.Contains(lower, "stores") || strings.Contains(lower, "persist") ||
+			strings.Contains(lower, "permanent") || strings.Contains(lower, "saved in")
+		if isStored {
+			// Stored XSS → high cap (same as highCapPatterns above)
+			if rank > severityRank["high"] {
+				return "high", "Stored XSS is high (CVSS 7.0-8.9) per HackerOne — needs admin access/mass ATO/RCE chain for critical"
+			}
+		} else {
+			// Reflected/DOM/generic XSS → medium cap (same as medCapPatterns above)
+			if rank > severityRank["medium"] {
+				return "medium", "Reflected/DOM XSS is medium (CVSS 4.0-6.9) per HackerOne — needs session hijack proof for high"
+			}
+		}
+	case "csrf":
+		if rank > severityRank["medium"] {
+			return "medium", "CSRF is medium (CVSS 4.0-6.9) per HackerOne — needs critical state change for high"
+		}
+	case "info_disclosure":
+		if rank > severityRank["medium"] {
+			return "medium", "Information disclosure is medium (CVSS 4.0-6.9) per HackerOne — needs PII/credential exposure for high"
+		}
+	case "ssrf":
+		if rank > severityRank["high"] {
+			return "high", "SSRF is high (CVSS 7.0-8.9) per HackerOne — needs cloud metadata/RCE for critical"
+		}
+	case "idor":
+		if rank > severityRank["high"] {
+			return "high", "IDOR is high (CVSS 7.0-8.9) per HackerOne — needs mass data dump for critical"
+		}
+	case "lfi":
+		if rank > severityRank["high"] {
+			return "high", "File inclusion is high (CVSS 7.0-8.9) per HackerOne — needs RCE for critical"
+		}
+	case "auth_bypass":
+		if rank > severityRank["high"] {
+			return "high", "Auth bypass is high (CVSS 7.0-8.9) per HackerOne — needs admin/root access for critical"
+		}
+	case "cors":
+		if rank > severityRank["low"] {
+			return "low", "CORS alone is low severity (CVSS 2.0-3.9) — needs proven cookie/token theft for higher"
+		}
+	case "open_redirect":
+		if rank > severityRank["low"] {
+			return "low", "Open redirect is low severity (CVSS 2.0-3.9) per HackerOne — needs OAuth/token chain for higher"
+		}
+	case "clickjacking":
+		if rank > severityRank["low"] {
+			return "low", "Clickjacking is low severity (CVSS 2.0-3.9) per HackerOne"
+		}
+	case "crlf":
+		if rank > severityRank["low"] {
+			return "low", "CRLF injection is low severity (CVSS 2.0-3.9) per HackerOne"
+		}
+	case "missing_header", "version_disclosure":
+		return "info", "Missing headers/version disclosure are informational"
+	}
+
 	return severity, "" // no cap needed
+}
+
+// isSensitiveEndpointContext returns true when the title+description or proof
+// text indicates the rate-limit issue targets a security-sensitive endpoint
+// (login, password reset, OTP/2FA verification, signup, account recovery, etc.).
+// These are areas where missing rate limiting can lead to credential stuffing,
+// brute-force attacks, or OTP bypass — making the finding genuinely impactful.
+func isSensitiveEndpointContext(lowerText, lowerProof string) bool {
+	combined := lowerText + " " + lowerProof
+	sensitiveKeywords := []string{
+		// Authentication
+		"login", "signin", "sign-in", "sign in", "authenticate",
+		"authentication", "credential", "credential stuffing",
+		// Password reset / recovery
+		"password reset", "forgot password", "reset password",
+		"password recovery", "account recovery", "reset token",
+		"reset link",
+		// OTP / 2FA / MFA
+		"otp", "one-time password", "one time password",
+		"2fa", "two-factor", "two factor", "mfa", "multi-factor",
+		"multi factor", "verification code", "sms code",
+		"totp", "authenticator code", "magic link",
+		// Signup / registration
+		"signup", "sign-up", "sign up", "registration", "register",
+		"create account", "new account",
+		// Email / phone verification
+		"email verification", "phone verification", "verify email",
+		"verify phone", "confirmation code",
+		// Sensitive API endpoints
+		"/auth", "/login", "/signin", "/signup", "/register",
+		"/reset", "/forgot", "/otp", "/verify", "/2fa", "/mfa",
+		"/token", "/session",
+		// Payment / financial
+		"payment", "checkout", "transaction", "purchase",
+		"coupon", "promo code", "discount code", "gift card",
+	}
+	for _, kw := range sensitiveKeywords {
+		if strings.Contains(combined, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractVulnType extracts a canonical vulnerability type from title/description

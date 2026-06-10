@@ -60,6 +60,10 @@ type Client struct {
 	//
 	// Validates: Requirement 11.2.
 	resolver Resolver
+	// tempOverride stores a *float64 for per-role temperature overrides.
+	// When set, effectiveTemperature() returns it instead of cfg.Temperature.
+	// Use SetTemperature() to change at runtime (e.g. scanner→validator→reporter).
+	tempOverride atomic.Value // *float64
 }
 
 // TokenUsage holds cumulative token counts.
@@ -143,7 +147,7 @@ type chatRequest struct {
 	Messages      []Message      `json:"messages"`
 	Stream        bool           `json:"stream"`
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
-	Temperature   float64        `json:"temperature,omitempty"`
+	Temperature   *float64       `json:"temperature,omitempty"`
 	MaxTokens     int            `json:"max_tokens,omitempty"`
 }
 
@@ -507,6 +511,28 @@ func (c *Client) Chat(messages []Message) (string, error) {
 	return c.chatWithRetry(messages)
 }
 
+// SetTemperature overrides the LLM temperature for subsequent calls.
+// Pass nil to revert to the config default.
+// This is goroutine-safe and takes effect on the next Chat/ChatStream call.
+func (c *Client) SetTemperature(temp *float64) {
+	if temp == nil {
+		c.tempOverride.Store((*float64)(nil))
+	} else {
+		// Copy so caller can't mutate after setting
+		v := *temp
+		c.tempOverride.Store(&v)
+	}
+}
+
+// effectiveTemperature returns the per-call override if set, otherwise
+// falls back to the config default.
+func (c *Client) effectiveTemperature() *float64 {
+	if v, ok := c.tempOverride.Load().(*float64); ok && v != nil {
+		return v
+	}
+	return c.cfg.Temperature
+}
+
 func (c *Client) chatWithRetry(messages []Message) (string, error) {
 	maxRetries := c.cfg.LLMMaxRetries
 	if maxRetries < 3 {
@@ -664,6 +690,7 @@ func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
 				Messages:      messages,
 				Stream:        true,
 				StreamOptions: &streamOptions{IncludeUsage: true},
+				Temperature:   c.effectiveTemperature(),
 			}
 			body, _ = json.Marshal(reqBody)
 		}
@@ -891,7 +918,7 @@ func (c *Client) doChat(messages []Message) (out string, err error) {
 			return "", fmt.Errorf("failed to marshal Anthropic request: %w", err)
 		}
 	} else {
-		reqBody := chatRequest{Model: model, Messages: messages, Stream: false}
+		reqBody := chatRequest{Model: model, Messages: messages, Stream: false, Temperature: c.effectiveTemperature()}
 		body, err = json.Marshal(reqBody)
 		if err != nil {
 			return "", fmt.Errorf("failed to marshal request: %w", err)

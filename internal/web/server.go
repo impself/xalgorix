@@ -1526,6 +1526,7 @@ var dashboardRoutes = []string{
 	// Existing scan / status / report / settings surface (unchanged).
 	"/api/scan",
 	"/api/stop",
+	"/api/restart",
 	"/api/status",
 	"/api/findings/summary",
 	"/api/legacy-import/status",
@@ -1579,6 +1580,8 @@ type Server struct {
 	cancelScan           context.CancelFunc      // cancels the current scan session context
 	running              atomic.Bool
 	stopReq              atomic.Bool
+	restartWhenIdle      atomic.Bool // SIGUSR1 sets this; a watcher restarts once scans drain
+	httpServer           *http.Server // set in Start; used to trigger graceful restart from the API
 	dataDir              string
 	currentScanDir       string
 	currentScanID        string
@@ -1594,6 +1597,11 @@ type Server struct {
 	schedulesMu          sync.RWMutex
 	schedules            map[string]*ScanSchedule
 	shutdownChan         chan struct{}
+	// scanListCache memoizes the built GET /api/scans list for a few seconds
+	// so paging/filtering/polling don't each re-walk the whole data dir.
+	scanListCacheMu sync.Mutex
+	scanListCache   []scanListItem
+	scanListCacheAt time.Time
 	// admissionWake is a buffered (len=1) channel used by runMultiScan's
 	// admission loop to wait fairly for a freed slot. A scan instance ending
 	// signals this channel non-blockingly in its defer cleanup, waking
@@ -1905,6 +1913,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/ws", s.handleWebSocket)
 	mux.HandleFunc("/api/scan", s.handleScan)
 	mux.HandleFunc("/api/stop", s.handleStop)
+	mux.HandleFunc("/api/restart", s.handleRestart)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/findings/summary", s.handleFindingsSummary)
 	mux.HandleFunc("/api/legacy-import/status", s.handleLegacyImportStatus)
@@ -2121,6 +2130,9 @@ func (s *Server) Start() error {
 		// dashboard serves interactive traffic, so keep this generous.
 		ReadHeaderTimeout: 30 * time.Second,
 	}
+	// Expose the server so the /api/restart handler can trigger a graceful
+	// restart-when-idle through the same path as the SIGUSR1 watcher.
+	s.httpServer = httpServer
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -2183,11 +2195,138 @@ func (s *Server) Start() error {
 		log.Printf("[SHUTDOWN] Graceful shutdown complete")
 	}()
 
+	// ── Graceful restart-when-idle on SIGUSR1 ──
+	// `xalgorix --restart-when-idle` sends SIGUSR1 to this process. We do not
+	// restart immediately: a watcher waits until no scan instance is active
+	// and no tool process is leased, then restarts cleanly (so in-flight
+	// engagements are never interrupted).
+	go func() {
+		usrCh := make(chan os.Signal, 1)
+		signal.Notify(usrCh, syscall.SIGUSR1)
+		for range usrCh {
+			if !s.scheduleGracefulRestart() {
+				log.Printf("[RESTART] Graceful restart already pending — ignoring duplicate SIGUSR1")
+			}
+		}
+	}()
+
 	err = httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil // graceful shutdown
 	}
 	return err
+}
+
+// scheduleGracefulRestart marks the server for a restart-when-idle and starts
+// the watcher that performs the restart once no scan/instance is active. It is
+// the shared entry point for both the SIGUSR1 signal and the POST /api/restart
+// endpoint. Returns false if a restart was already pending (idempotent), so
+// duplicate requests don't spawn multiple watchers.
+func (s *Server) scheduleGracefulRestart() bool {
+	if s.restartWhenIdle.Swap(true) {
+		return false
+	}
+	log.Printf("[RESTART] Graceful restart requested — will restart once all scans finish")
+	if s.discordWebhook != "" {
+		s.sendDiscord(0x4dabf7, "🕓 Xalgorix Restart Scheduled",
+			"A restart was requested. Xalgorix will restart automatically once all running scans finish and no tools are active.")
+	}
+	go s.restartWhenIdleWatcher(s.httpServer)
+	return true
+}
+
+// scannerIdle reports whether it is safe to restart: no scan instance is// active (running/pending/paused/queued/starting) and no terminal tool is
+// currently leased. Completed/stopped/failed instances are historical and
+// do not block a restart.
+func (s *Server) scannerIdle() bool {
+	s.instancesMu.RLock()
+	for _, inst := range s.instances {
+		inst.mu.RLock()
+		st := strings.ToLower(strings.TrimSpace(inst.Status))
+		inst.mu.RUnlock()
+		switch st {
+		case "running", "pending", "paused", "queued", "starting":
+			s.instancesMu.RUnlock()
+			return false
+		}
+	}
+	s.instancesMu.RUnlock()
+	if s.running.Load() {
+		return false
+	}
+	if resources.Capacity().ActiveToolLeases > 0 {
+		return false
+	}
+	return true
+}
+
+// restartWhenIdleWatcher polls scanner state after a SIGUSR1 request and
+// triggers a restart once the scanner has been idle for a few consecutive
+// checks (debounced so a brief gap between queued targets does not trigger an
+// early restart).
+func (s *Server) restartWhenIdleWatcher(httpServer *http.Server) {
+	const interval = 5 * time.Second
+	const idleChecksNeeded = 3 // ~15s of sustained idle before restarting
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	idleStreak := 0
+	for range ticker.C {
+		if !s.restartWhenIdle.Load() {
+			return // request was cleared elsewhere
+		}
+		if s.scannerIdle() {
+			idleStreak++
+			if idleStreak >= idleChecksNeeded {
+				s.restartNow(httpServer)
+				return
+			}
+		} else {
+			idleStreak = 0
+		}
+	}
+}
+
+// restartNow performs the actual restart. Under systemd (Restart=always) a
+// clean exit is enough — systemd re-runs ExecStart, reloading the env file.
+// Outside systemd (background mode) we re-exec the binary in place so the
+// service comes back without an external supervisor. Either path also picks
+// up a newly-installed binary on disk.
+func (s *Server) restartNow(httpServer *http.Server) {
+	log.Printf("[RESTART] Scanner idle — restarting now")
+	if s.discordWebhook != "" {
+		s.sendDiscord(0x4dabf7, "🔄 Xalgorix Restarting", "Scanner is idle. Restarting now; interrupted work (if any) auto-resumes.")
+	}
+
+	// Belt-and-suspenders: reap any stray tool processes before we go.
+	terminal.KillAllProcesses()
+
+	// Release the listening socket so the restarted process can rebind.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if httpServer != nil {
+		if err := httpServer.Shutdown(ctx); err != nil {
+			log.Printf("[RESTART] HTTP shutdown error: %v", err)
+		}
+	}
+
+	// systemd-managed: INVOCATION_ID is set by systemd for service units.
+	// A clean exit triggers Restart=always with a freshly-loaded env file.
+	if os.Getenv("INVOCATION_ID") != "" {
+		log.Printf("[RESTART] Exiting for systemd to restart (fresh environment)")
+		os.Exit(0)
+	}
+
+	// Background mode: re-exec in place.
+	exe, err := os.Executable()
+	if err != nil || strings.TrimSpace(exe) == "" {
+		exe = os.Args[0]
+	}
+	log.Printf("[RESTART] Re-executing %s", exe)
+	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+		log.Printf("[RESTART] re-exec failed: %v — exiting for supervisor restart", err)
+		os.Exit(0)
+	}
 }
 
 // initDataDir is a thin wrapper around cfg.DataDir (Task 3.6 / R6.4, R6.6):
@@ -2494,6 +2633,34 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
 
+// handleRestart schedules a graceful restart of the backend. The restart is
+// never immediate while work is in flight: it waits until no scan instance is
+// active and no tool process is leased, then restarts cleanly (in-flight scans
+// auto-resume afterwards). This is the HTTP equivalent of
+// `xalgorix --restart-when-idle` (SIGUSR1) and shares the same watcher.
+//
+// POST /api/restart  → { "status": "scheduled"|"already_pending", "idle": bool }
+func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	idle := s.scannerIdle()
+	scheduled := s.scheduleGracefulRestart()
+
+	status := "scheduled"
+	if !scheduled {
+		status = "already_pending"
+	}
+	log.Printf("[RESTART] /api/restart requested (idle=%v, status=%s)", idle, status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": status,
+		"idle":   idle,
+	})
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	s.mu.RLock()
@@ -2744,6 +2911,76 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 		return instances[i].StartedAt > instances[j].StartedAt
 	})
 
+	// Distinct scan modes across ALL instances, computed before filtering so
+	// the UI's mode dropdown always offers the full set of options.
+	modeSet := make(map[string]struct{})
+	for _, inst := range instances {
+		if inst.ScanMode != "" {
+			modeSet[inst.ScanMode] = struct{}{}
+		}
+	}
+	modes := make([]string, 0, len(modeSet))
+	for m := range modeSet {
+		modes = append(modes, m)
+	}
+	sort.Strings(modes)
+
+	// Optional server-side filtering (no-ops when the params are absent).
+	if q := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q"))); q != "" {
+		filtered := make([]*ScanInstance, 0, len(instances))
+		for _, inst := range instances {
+			if strings.Contains(strings.ToLower(inst.Name), q) ||
+				strings.Contains(strings.ToLower(inst.Targets), q) ||
+				strings.Contains(strings.ToLower(inst.ID), q) {
+				filtered = append(filtered, inst)
+			}
+		}
+		instances = filtered
+	}
+	if st := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("status"))); st != "" && st != "all" {
+		filtered := make([]*ScanInstance, 0, len(instances))
+		for _, inst := range instances {
+			if strings.ToLower(inst.Status) == st {
+				filtered = append(filtered, inst)
+			}
+		}
+		instances = filtered
+	}
+	if mode := strings.TrimSpace(r.URL.Query().Get("mode")); mode != "" && mode != "all" {
+		filtered := make([]*ScanInstance, 0, len(instances))
+		for _, inst := range instances {
+			if inst.ScanMode == mode {
+				filtered = append(filtered, inst)
+			}
+		}
+		instances = filtered
+	}
+
+	// Pagination is opt-in: only slice when a page/size param is present, so
+	// the default GET /api/instances response still returns every instance.
+	total := len(instances)
+	pageStr := r.URL.Query().Get("page")
+	sizeStr := r.URL.Query().Get("size")
+	page, size := 1, 0
+	if pageStr != "" || sizeStr != "" {
+		page, size = parsePageParams(pageStr, sizeStr)
+		start := (page - 1) * size
+		if start < 0 {
+			start = 0
+		}
+		if start > total {
+			start = total
+		}
+		end := start + size
+		if end > total {
+			end = total
+		}
+		instances = instances[start:end]
+	}
+	if instances == nil {
+		instances = []*ScanInstance{}
+	}
+
 	// Include resource stats so the UI can explain why scans are pending
 	stats := resources.GetStats()
 	level, _ := resources.CurrentLevel()
@@ -2751,6 +2988,10 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 	capacity := resources.Capacity()
 	response := map[string]any{
 		"instances": instances,
+		"total":     total,
+		"page":      page,
+		"size":      size,
+		"modes":     modes,
 		"resources": map[string]any{
 			"cpu_cores":                stats.CPUCores,
 			"cpu_load_1m":              stats.LoadAvg1m,
@@ -6489,25 +6730,64 @@ func (s *Server) rebuildInstancesFromDisk() {
 		inst.chatCfg = &chatCfg
 		s.instances[entry.rec.ID] = inst
 	}
+	// Statuses may have been rewritten on disk above (running → stopped), so
+	// drop any memoized scan list built before recovery.
+	s.invalidateScanListCache()
+}
+
+// parsePageParams parses the `page` and `size` query parameters into a
+// 1-indexed page number and a bounded page size. Invalid or missing values
+// fall back to page 1 / size 50, and size is capped at 500 to protect the
+// server from absurd page sizes.
+func parsePageParams(pageStr, sizeStr string) (page, size int) {
+	page, size = 1, 50
+	if v, err := strconv.Atoi(strings.TrimSpace(pageStr)); err == nil && v >= 1 {
+		page = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(sizeStr)); err == nil && v >= 1 {
+		size = v
+		if size > 500 {
+			size = 500
+		}
+	}
+	return page, size
 }
 
 // handleListScans returns a list of all saved scans (sorted newest first).
-func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
-	type scanInfo struct {
-		ID               string `json:"id"`
-		Target           string `json:"target"`
-		StartedAt        string `json:"started_at"`
-		Status           string `json:"status"`
-		ScanMode         string `json:"scan_mode,omitempty"`
-		VulnCount        int    `json:"vuln_count"`
-		TotalTokens      int    `json:"total_tokens"`
-		SubScanTotal     int    `json:"sub_scan_total,omitempty"`
-		SubScanCompleted int    `json:"sub_scan_completed,omitempty"`
-		SubScanRunning   int    `json:"sub_scan_running,omitempty"`
-		SubScanRemaining int    `json:"sub_scan_remaining,omitempty"`
-	}
+// scanListItem is the lightweight per-scan row returned by GET /api/scans.
+type scanListItem struct {
+	ID               string `json:"id"`
+	Target           string `json:"target"`
+	StartedAt        string `json:"started_at"`
+	Status           string `json:"status"`
+	ScanMode         string `json:"scan_mode,omitempty"`
+	VulnCount        int    `json:"vuln_count"`
+	TotalTokens      int    `json:"total_tokens"`
+	SubScanTotal     int    `json:"sub_scan_total,omitempty"`
+	SubScanCompleted int    `json:"sub_scan_completed,omitempty"`
+	SubScanRunning   int    `json:"sub_scan_running,omitempty"`
+	SubScanRemaining int    `json:"sub_scan_remaining,omitempty"`
+}
 
-	var scans []scanInfo
+// scanListCacheTTL bounds how long a built scan list is reused. Building the
+// list walks the entire data dir and JSON-parses every scan.json, so without
+// this cache each page/filter/poll request repeated that full-disk scan. The
+// list view tolerates a few seconds of status lag (the instances page and the
+// WebSocket feed are the live surfaces); deletes invalidate the cache for
+// immediate effect.
+const scanListCacheTTL = 5 * time.Second
+
+// cachedScanList returns the sorted (newest-first) scan list, rebuilding it
+// from disk at most once per scanListCacheTTL. The returned slice is shared
+// read-only across callers — never mutate its elements; filtering/paginating
+// must build new slices.
+func (s *Server) cachedScanList() []scanListItem {
+	s.scanListCacheMu.Lock()
+	defer s.scanListCacheMu.Unlock()
+	if s.scanListCache != nil && time.Since(s.scanListCacheAt) < scanListCacheTTL {
+		return s.scanListCache
+	}
+	var scans []scanListItem
 	for _, entry := range s.findAllScans() {
 		if entry.rec.ParentTarget != "" {
 			continue
@@ -6515,7 +6795,7 @@ func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
 		rec := entry.rec
 		s.applyInstanceSnapshot(&rec, false)
 		s.attachWildcardSubScans(&rec)
-		scans = append(scans, scanInfo{
+		scans = append(scans, scanListItem{
 			ID:               rec.ID,
 			Target:           rec.Target,
 			StartedAt:        rec.StartedAt,
@@ -6529,14 +6809,85 @@ func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
 			SubScanRemaining: rec.SubScanRemaining,
 		})
 	}
-
-	// Sort newest first
+	// Sort newest first.
 	sort.Slice(scans, func(i, j int) bool {
 		return scans[i].StartedAt > scans[j].StartedAt
 	})
+	s.scanListCache = scans
+	s.scanListCacheAt = time.Now()
+	return scans
+}
+
+// invalidateScanListCache forces the next GET /api/scans to rebuild from disk.
+// Called after mutations (e.g. scan deletion) so the change is reflected
+// immediately rather than after the TTL.
+func (s *Server) invalidateScanListCache() {
+	s.scanListCacheMu.Lock()
+	s.scanListCache = nil
+	s.scanListCacheMu.Unlock()
+}
+
+func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
+	scans := s.cachedScanList()
+
+	// Optional server-side filtering. These are no-ops when the query params
+	// are absent, so the default GET /api/scans response is unchanged. Build
+	// new slices so the shared cache is never mutated.
+	if q := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q"))); q != "" {
+		filtered := make([]scanListItem, 0, len(scans))
+		for _, sc := range scans {
+			if strings.Contains(strings.ToLower(sc.Target), q) ||
+				strings.Contains(strings.ToLower(sc.ID), q) {
+				filtered = append(filtered, sc)
+			}
+		}
+		scans = filtered
+	}
+	if st := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("status"))); st != "" && st != "all" {
+		filtered := make([]scanListItem, 0, len(scans))
+		for _, sc := range scans {
+			if strings.ToLower(sc.Status) == st {
+				filtered = append(filtered, sc)
+			}
+		}
+		scans = filtered
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(scans)
+
+	// Pagination is opt-in. Without a page/size query param we preserve the
+	// historical bare-array response for backward compatibility (public API
+	// consumers and existing callers). With it, we return a paginated
+	// envelope { items, total, page, size }.
+	pageStr := r.URL.Query().Get("page")
+	sizeStr := r.URL.Query().Get("size")
+	if pageStr == "" && sizeStr == "" {
+		_ = json.NewEncoder(w).Encode(scans)
+		return
+	}
+	page, size := parsePageParams(pageStr, sizeStr)
+	total := len(scans)
+	start := (page - 1) * size
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	end := start + size
+	if end > total {
+		end = total
+	}
+	items := scans[start:end]
+	if items == nil {
+		items = []scanListItem{}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"items": items,
+		"total": total,
+		"page":  page,
+		"size":  size,
+	})
 }
 
 // handleDownloadReport serves the PDF report for a scan.
@@ -7186,6 +7537,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 			delete(s.instances, id)
 		}
 		s.instancesMu.Unlock()
+		s.invalidateScanListCache()
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"deleted"}`))
 		return

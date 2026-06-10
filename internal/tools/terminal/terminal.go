@@ -1373,9 +1373,25 @@ func runShellInternal(contextID string, command string) (string, int) {
 	cmd.Dir = workDir
 	cmd.Env = commandEnv(homeDir, goPath, workDir, rateRuntime)
 
-	// Create new process group for this command
+	// Create new process group for this command so we can kill the
+	// entire tree (bash + children like curl) on timeout.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
+	}
+
+	// Kill the entire process group on context cancellation/timeout.
+	// exec.CommandContext only sends SIGKILL to the parent bash process,
+	// but child processes (curl, for loops, etc.) in the new process group
+	// survive as orphans, keeping stdout/stderr pipes open. This causes
+	// wg.Wait() to block until the watchdog's 30-minute kill.
+	// Fix: use cmd.Cancel to send SIGKILL to the negative PGID, which
+	// kills the entire tree and closes all pipe write ends.
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			// Kill entire process group: negative PID = process group
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return os.ErrProcessDone
 	}
 
 	// Use pipes for real-time output streaming
@@ -1451,10 +1467,16 @@ func runShellInternal(contextID string, command string) (string, int) {
 		}
 	}()
 
-	// Wait for output readers to finish
+	// Wait for output readers to finish, then the process.
+	// IMPORTANT: wg.Wait() MUST run before cmd.Wait(). The Go docs say
+	// "it is incorrect to call Wait before all reads from the pipe have
+	// completed" when using StdoutPipe — calling cmd.Wait() first would
+	// close the pipes and lose buffered data.
+	//
+	// On timeout: cmd.Cancel kills the entire process group (SIGKILL to
+	// -PGID), which closes all pipe write ends, causing the goroutines
+	// to get EOF → wg.Wait() returns → cmd.Wait() runs.
 	wg.Wait()
-
-	// Wait for command to finish
 	err = cmd.Wait()
 	// Note: process unregistration is handled by defer UntrackProcess(cmd) above
 
@@ -2001,25 +2023,59 @@ func extractCommands(cmd string) []string {
 	return result
 }
 
-// checkObfuscation detects common obfuscation techniques
+// hexEscapeRe matches a single \xNN hex-escape byte (e.g. \x72).
+var hexEscapeRe = regexp.MustCompile(`(?i)\\x([0-9a-f]{2})`)
+
+// chrCallRe matches chr(NN) / CHR( NN ) style character-code calls.
+var chrCallRe = regexp.MustCompile(`(?i)chr\s*\(\s*(\d{1,3})\s*\)`)
+
+// decodeHexEscapes replaces \xNN escape sequences with their literal byte
+// value, leaving the rest of the command untouched, so the decoded form can be
+// matched against the destructive-command denylist.
+func decodeHexEscapes(cmd string) string {
+	return hexEscapeRe.ReplaceAllStringFunc(cmd, func(m string) string {
+		b, err := decodeHex(m[2:])
+		if err != nil || len(b) != 1 {
+			return m
+		}
+		return string(b)
+	})
+}
+
+// decodeChrCalls replaces chr(NN) calls with their literal character.
+func decodeChrCalls(cmd string) string {
+	return chrCallRe.ReplaceAllStringFunc(cmd, func(m string) string {
+		sub := chrCallRe.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		n, err := strconv.Atoi(sub[1])
+		if err != nil || n < 0 || n > 255 {
+			return m
+		}
+		return string(rune(n))
+	})
+}
+
+// checkObfuscation detects obfuscation techniques that DECODE to a destructive
+// command. Earlier versions blanket-blocked any \xNN hex escape or chr() call
+// regardless of what it decoded to, which produced false positives on
+// legitimate pentest payloads (e.g. \x90 NOP sleds, \x00 fuzz bytes, SQL
+// injection CHAR()/CHR() expressions). We now decode the obfuscated bytes and
+// only block when the decoded text matches the destructive-command denylist.
+// Note: fully hex-encoded commands are already handled by tryHexDecode in
+// isBlockedCommand; this function covers \xNN / chr() escapes embedded inside a
+// larger command string.
 func checkObfuscation(cmd string) string {
-	lower := strings.ToLower(cmd)
-
-	// Check for character substitution obfuscation
-	// e.g., c'h'o'p, r\m -rf, etc.
-	obfuscationPatterns := []struct {
-		pattern string
-		reason  string
-	}{
-		{"chr\\s*\\(", "character code obfuscation"},
-		{"\\\\x[0-9a-f]{2}", "hex escape obfuscation"},
-	}
-
-	for _, op := range obfuscationPatterns {
-		if matched, _ := regexp.MatchString(op.pattern, lower); matched {
-			return "obfuscated command detected: " + op.reason
+	if decoded := decodeHexEscapes(cmd); decoded != cmd {
+		if reason := checkBlocked(decoded); reason != "" {
+			return "obfuscated command detected: " + reason + " (via hex escape decoding)"
 		}
 	}
-
+	if decoded := decodeChrCalls(cmd); decoded != cmd {
+		if reason := checkBlocked(decoded); reason != "" {
+			return "obfuscated command detected: " + reason + " (via chr() decoding)"
+		}
+	}
 	return ""
 }

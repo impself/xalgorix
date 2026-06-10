@@ -71,6 +71,11 @@ linters:
       enable-all: true
     misspell:
       locale: US
+      # MITRE is a proper noun (MITRE ATT&CK), not a misspelling of "miter".
+      # It appears in skill directory names that are referenced as alias
+      # targets in skills.go.
+      ignore-rules:
+        - mitre
     revive:
       severity: warning
       rules:
@@ -113,12 +118,6 @@ linters:
           - revive
         text: should have comment
     paths:
-      # WIP multi-tenant SaaS surface. It is not part of the shipped
-      # self-hosted binary (cmd/xalgorix) and carries a large pre-existing
-      # lint backlog; lint it separately once it stabilizes. The rest of the
-      # module is held lint-clean.
-      - internal/cloud
-      - cmd/xalgorix-cloud
       - webui/node_modules
       - webui/dist
       - webui/build
@@ -138,8 +137,6 @@ formatters:
   exclusions:
     generated: lax
     paths:
-      - internal/cloud
-      - cmd/xalgorix-cloud
       - webui/node_modules
       - webui/dist
       - webui/build

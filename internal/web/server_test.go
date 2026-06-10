@@ -2037,6 +2037,73 @@ func TestLLMSettings_CatalogShape_RejectsUnknownProvider(t *testing.T) {
 	}
 }
 
+// TestLLMSettings_CatalogShape_ProviderSwitchWithMaskedKey is a regression
+// test for the "provider reverts after refresh" bug: switching the provider
+// while leaving the API key masked (**** — the UI tells the operator to keep
+// it to preserve the saved key) must still persist the new provider by moving
+// the XALGORIX_LLM_PROFILE pointer. Previously the api_key branch was gated on
+// a freshly-typed key, so only the model env var changed and the provider
+// derived back to the stale profile on the next GET.
+func TestLLMSettings_CatalogShape_ProviderSwitchWithMaskedKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".xalgorix.env"), []byte(""), 0o644); err != nil {
+		t.Fatalf("seed env file: %v", err)
+	}
+
+	s := newTestServer(t, &config.Config{
+		ReasoningEffort:   "high",
+		RateLimitRequests: 60,
+		RateLimitWindow:   60,
+	})
+
+	// 1) Initial save under litellm with a real key.
+	rr := httptest.NewRecorder()
+	body := strings.NewReader(`{"provider":"litellm","authMethod":"api_key","profileId":"default","apiKey":"sk-real-key","model":"minimax/MiniMax-M2.7"}`)
+	s.handleLLMSettings(rr, httptest.NewRequest(http.MethodPost, "/api/settings/llm", body))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST #1 code = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if s.cfg.LLMProfile != "litellm:default" {
+		t.Fatalf("after POST #1 LLMProfile = %q, want litellm:default", s.cfg.LLMProfile)
+	}
+
+	// 2) Switch the provider to minimax but KEEP the masked key.
+	rr = httptest.NewRecorder()
+	body = strings.NewReader(`{"provider":"minimax","authMethod":"api_key","profileId":"default","apiKey":"****-key","model":"minimax/MiniMax-M2.7"}`)
+	s.handleLLMSettings(rr, httptest.NewRequest(http.MethodPost, "/api/settings/llm", body))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST #2 code = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// The active profile pointer must have moved to minimax.
+	if s.cfg.LLMProfile != "minimax:default" {
+		t.Fatalf("after provider switch LLMProfile = %q, want minimax:default", s.cfg.LLMProfile)
+	}
+	// A minimax profile must exist, carrying over the previously-saved key.
+	prof, ok, err := s.profiles.Get(context.Background(), "minimax:default")
+	if err != nil {
+		t.Fatalf("profile get: %v", err)
+	}
+	if !ok {
+		t.Fatalf("minimax:default profile not persisted after switch")
+	}
+	if prof.APIKey != "sk-real-key" {
+		t.Fatalf("minimax profile APIKey = %q, want carried-over sk-real-key", prof.APIKey)
+	}
+
+	// 3) GET must now report minimax — the symptom the user saw (reverting
+	// to litellm on refresh) is fixed.
+	rr = httptest.NewRecorder()
+	s.handleLLMSettings(rr, httptest.NewRequest(http.MethodGet, "/api/settings/llm", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET code = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"provider":"minimax"`) {
+		t.Fatalf("GET provider did not persist as minimax; body=%s", rr.Body.String())
+	}
+}
+
 func TestEnvironmentSettings_RejectsUnknownAndUpdatesRuntime(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -2556,5 +2623,49 @@ func TestIntegration_WebFetcherCrossCheckMatchesAgentGuardOracle(t *testing.T) {
 					tc.wantBlocked, tc.target, tc.category, prodVerdict)
 			}
 		})
+	}
+}
+
+// TestScannerIdle covers the restart-when-idle gate: a restart may only fire
+// when no scan instance is active and the server is not mid-scan.
+func TestScannerIdle(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	// Fresh server, no instances → idle.
+	if !s.scannerIdle() {
+		t.Fatalf("fresh server should be idle")
+	}
+
+	// Active instance statuses block a restart.
+	for _, st := range []string{"running", "pending", "paused", "queued", "starting"} {
+		s.instancesMu.Lock()
+		s.instances = map[string]*ScanInstance{"i": {ID: "i", Status: st}}
+		s.instancesMu.Unlock()
+		if s.scannerIdle() {
+			t.Fatalf("status %q should NOT be idle", st)
+		}
+	}
+
+	// Terminal statuses are historical and do not block a restart.
+	for _, st := range []string{"finished", "stopped", "failed"} {
+		s.instancesMu.Lock()
+		s.instances = map[string]*ScanInstance{"i": {ID: "i", Status: st}}
+		s.instancesMu.Unlock()
+		if !s.scannerIdle() {
+			t.Fatalf("status %q should be idle", st)
+		}
+	}
+
+	// The global running flag also blocks a restart.
+	s.instancesMu.Lock()
+	s.instances = map[string]*ScanInstance{}
+	s.instancesMu.Unlock()
+	s.running.Store(true)
+	if s.scannerIdle() {
+		t.Fatalf("server with running=true should NOT be idle")
+	}
+	s.running.Store(false)
+	if !s.scannerIdle() {
+		t.Fatalf("server should be idle after running cleared")
 	}
 }
